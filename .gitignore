@@ -1,0 +1,18 @@
+# 数据库文件 (绝对不要上传)
+chroma_db/
+db_*/
+*.pkl
+file_weights.json
+
+# 敏感配置文件
+config.json
+libraries.json
+
+# Python 缓存
+__pycache__/
+*.pyc
+model_cache/
+
+# 虚拟环境
+venv/
+.env

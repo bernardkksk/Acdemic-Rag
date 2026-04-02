@@ -1,0 +1,25 @@
+# 核心框架
+langchain>=0.1.0
+langchain-community
+langchain-chroma
+langchain-huggingface
+langchain-openai
+langchain-google-genai
+
+# UI 界面
+customtkinter
+
+# 文档处理
+pypdf
+docx2txt
+beautifulsoup4
+requests
+
+# 向量计算与模型
+sentence-transformers
+torch
+numpy
+chromadb
+
+# 辅助工具
+rank_bm25
