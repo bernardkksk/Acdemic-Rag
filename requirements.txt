@@ -1,6 +1,8 @@
 # 核心框架
 langchain>=0.1.0
+langchain-core
 langchain-community
+langchain-text-splitters
 langchain-chroma
 langchain-huggingface
 langchain-openai
@@ -14,9 +16,14 @@ pypdf
 docx2txt
 beautifulsoup4
 requests
+chardet>=3.0.2,<6.0.0
+aiohttp
 
 # 向量计算与模型
-sentence-transformers
+transformers
+huggingface_hub
+safetensors
+sentencepiece
 torch
 numpy
 chromadb

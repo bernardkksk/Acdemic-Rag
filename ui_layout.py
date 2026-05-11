@@ -87,30 +87,33 @@ class AppUIBuilder:
                 text_color=TEXT,
                 command=lambda item=library: self.app.preview_library(item),
             )
-            select_btn.pack(side="left", fill="x", expand=True, padx=(6, 4), pady=6)
+            select_btn.pack(fill="x", padx=6, pady=(6, 4))
+
+            actions = ctk.CTkFrame(row, fg_color="transparent")
+            actions.pack(fill="x", padx=6, pady=(0, 6))
 
             ctk.CTkButton(
-                row,
-                text="r",
-                width=26,
+                actions,
+                text="重命名",
+                width=68,
                 height=26,
                 fg_color=SOFT,
                 hover_color="#dddddd",
                 text_color=TEXT,
                 command=lambda item=library: self.app.rename_library(item),
-            ).pack(side="right", padx=(0, 6), pady=6)
+            ).pack(side="left")
 
             if library["path"] != "./chroma_db":
                 ctk.CTkButton(
-                    row,
-                    text="x",
-                    width=26,
+                    actions,
+                    text="删除",
+                    width=56,
                     height=26,
                     fg_color="#f8e7e7",
                     hover_color="#f2d1d1",
                     text_color=ERROR,
                     command=lambda item=library: self.app.delete_library(item),
-                ).pack(side="right", padx=(0, 6), pady=6)
+                ).pack(side="left", padx=(8, 0))
 
     def create_tabs(self):
         self.app.tabview = ctk.CTkTabview(self.app, corner_radius=12, fg_color=BG)
@@ -169,8 +172,53 @@ class AppUIBuilder:
             "风格",
             self.app.answer_style_var,
             academic_prompt.get_supported_styles(),
-            None,
+            self.app.on_answer_style_change,
         )
+        self.app.target_document_panel = ctk.CTkFrame(
+            control,
+            fg_color=SOFT,
+            border_width=1,
+            border_color=BORDER,
+            corner_radius=8,
+        )
+        ctk.CTkLabel(
+            self.app.target_document_panel,
+            text="目标文章",
+            anchor="w",
+            text_color=TEXT,
+        ).pack(anchor="w", padx=10, pady=(8, 4))
+        self.app.target_document_label = ctk.CTkLabel(
+            self.app.target_document_panel,
+            text="未选择",
+            anchor="w",
+            justify="left",
+            wraplength=104,
+            text_color=MUTED,
+            font=ctk.CTkFont(size=11),
+        )
+        self.app.target_document_label.pack(fill="x", padx=10, pady=(0, 6))
+        target_actions = ctk.CTkFrame(self.app.target_document_panel, fg_color="transparent")
+        target_actions.pack(fill="x", padx=10, pady=(0, 8))
+        ctk.CTkButton(
+            target_actions,
+            text="选择",
+            command=self.app.select_target_document,
+            width=52,
+            height=26,
+            fg_color=ACCENT,
+            hover_color=ACCENT_SOFT,
+        ).pack(side="left")
+        ctk.CTkButton(
+            target_actions,
+            text="清除",
+            command=self.app.clear_target_document,
+            width=52,
+            height=26,
+            fg_color=SURFACE,
+            hover_color="#dddddd",
+            text_color=TEXT,
+        ).pack(side="left", padx=(6, 0))
+
         self.app.primary_library_menu = self._add_option_field(
             control,
             "主库",
@@ -388,6 +436,8 @@ class AppUIBuilder:
         ctk.CTkButton(controls, text="删除选中", width=100, command=self.app.delete_selected_file, fg_color="#f8e7e7", hover_color="#f2d1d1", text_color=ERROR).pack(side="right", padx=(8, 0))
         ctk.CTkButton(controls, text="清空当前库", width=110, command=self.app.clear_all, fg_color="#f8e7e7", hover_color="#f2d1d1", text_color=ERROR).pack(side="right")
 
+        ctk.CTkButton(controls, text="重建索引", width=96, command=self.app.rebuild_current_library_index, fg_color=SOFT, hover_color="#dddddd", text_color=TEXT).pack(side="left", padx=(0, 8))
+
         self.app.file_frame = ctk.CTkScrollableFrame(
             container,
             fg_color=SURFACE,
@@ -545,13 +595,41 @@ class AppUIBuilder:
             label = str(source or "").rsplit("\\", 1)[-1].rsplit("/", 1)[-1] or str(source or "")
         return label if len(label) <= limit else label[: limit - 3] + "..."
 
-    def render_file_tree(self, metas, ids, count, current_weights):
+    def _pdf_status_suffix(self, meta):
+        if not meta:
+            return ""
+        status = str(meta.get("status") or "").lower()
+        labels = []
+        if status == "success":
+            labels.append("正常")
+        elif status == "failed":
+            labels.append("失败")
+        return " · ".join(labels)
+
+    def _merge_file_meta(self, current_meta, new_meta):
+        if not current_meta:
+            return dict(new_meta or {})
+        if not new_meta:
+            return dict(current_meta)
+        merged = dict(current_meta)
+        for key, value in dict(new_meta).items():
+            if value not in (None, "", 0):
+                merged[key] = value
+        status_rank = {"success": 1, "ocr": 2, "partial": 3, "failed": 4}
+        current_rank = status_rank.get(str(current_meta.get("status") or "").lower(), 0)
+        new_rank = status_rank.get(str(new_meta.get("status") or "").lower(), 0)
+        if new_rank >= current_rank:
+            merged["status"] = new_meta.get("status")
+        return merged
+
+    def render_file_tree(self, metas, ids, count, current_weights, status_manifest=None):
         for widget in self.app.file_frame.winfo_children():
             widget.destroy()
         self.app.file_checkboxes.clear()
         self.app.file_id_map.clear()
         self.app.file_delete_sources.clear()
         self.app.file_weight_targets.clear()
+        status_manifest = status_manifest or {}
 
         groups = {"PDF": {}, "WORD": {}, "TXT": {}, "URL": {}, "OTHER": {}}
         colors = {"PDF": "#b42318", "WORD": "#1d4ed8", "TXT": MUTED, "URL": SUCCESS, "OTHER": MUTED}
@@ -564,11 +642,23 @@ class AppUIBuilder:
             file_type = self._normalize_file_type(meta.get("type"))
             if file_type == "URL":
                 parent_url = str(meta.get("parent") or source)
-                entry = groups["URL"].setdefault(parent_url, {"ids": [], "children": {}})
+                entry = groups["URL"].setdefault(parent_url, {"ids": [], "children": {}, "meta": dict(meta)})
                 entry["ids"].append(ids[idx])
-                entry["children"].setdefault(source, []).append(ids[idx])
+                entry["meta"] = self._merge_file_meta(entry.get("meta"), meta)
+                child_entry = entry["children"].setdefault(source, {"ids": [], "meta": dict(meta)})
+                child_entry["ids"].append(ids[idx])
+                child_entry["meta"] = self._merge_file_meta(child_entry.get("meta"), meta)
             else:
-                groups[file_type].setdefault(source, []).append(ids[idx])
+                entry = groups[file_type].setdefault(source, {"ids": [], "meta": dict(meta)})
+                entry["ids"].append(ids[idx])
+                entry["meta"] = self._merge_file_meta(entry.get("meta"), meta)
+
+        for source, meta in status_manifest.items():
+            file_type = self._normalize_file_type(meta.get("type"))
+            if file_type != "PDF":
+                continue
+            entry = groups["PDF"].setdefault(source, {"ids": [], "meta": dict(meta)})
+            entry["meta"] = self._merge_file_meta(entry.get("meta"), meta)
 
         group_order = ["PDF", "WORD", "TXT", "URL", "OTHER"]
         for group_name in group_order:
@@ -601,12 +691,12 @@ class AppUIBuilder:
                 for parent_url, payload in sorted(items.items(), key=lambda item: item[0].lower()):
                     self._render_url_parent_block(body, parent_url, payload, current_weights)
             else:
-                for source, doc_ids in sorted(items.items(), key=lambda item: item[0].lower()):
+                for source, payload in sorted(items.items(), key=lambda item: item[0].lower()):
                     self._render_file_row(
                         body,
                         key=source,
                         source=source,
-                        doc_ids=doc_ids,
+                        doc_ids=payload["ids"],
                         color=colors.get(group_name, TEXT),
                         current_weights=current_weights,
                         weight_target=source,
@@ -614,6 +704,8 @@ class AppUIBuilder:
                         parent=None,
                         is_url=False,
                         indent=0,
+                        suffix=self._pdf_status_suffix(payload.get("meta")) if group_name == "PDF" else "",
+                        meta_summary=payload.get("meta"),
                     )
 
         self.app.set_pipeline_state(
@@ -628,7 +720,7 @@ class AppUIBuilder:
         box.pack(fill="x", padx=4, pady=4)
 
         child_sources = sorted(payload["children"].items(), key=lambda item: item[0].lower())
-        nested_sources = [(source, doc_ids) for source, doc_ids in child_sources if source != parent_url]
+        nested_sources = [(source, child_payload) for source, child_payload in child_sources if source != parent_url]
         expanded = self.app.file_tree_state["urls"].get(parent_url, False)
 
         self._render_file_row(
@@ -647,17 +739,18 @@ class AppUIBuilder:
             toggle=(parent_url if nested_sources else None),
             toggle_expanded=expanded,
             toggle_count=len(nested_sources),
+            meta_summary=payload.get("meta"),
         )
 
         if expanded and nested_sources:
             child_wrap = ctk.CTkFrame(box, fg_color="transparent")
             child_wrap.pack(fill="x", padx=6, pady=(0, 6))
-            for source, doc_ids in nested_sources:
+            for source, child_payload in nested_sources:
                 self._render_file_row(
                     child_wrap,
                     key=f"url-child::{parent_url}::{source}",
                     source=source,
-                    doc_ids=doc_ids,
+                    doc_ids=child_payload["ids"],
                     color=TEXT,
                     current_weights=current_weights,
                     weight_target=source,
@@ -666,6 +759,7 @@ class AppUIBuilder:
                     is_url=True,
                     indent=18,
                     suffix="子 URL",
+                    meta_summary=child_payload.get("meta"),
                 )
 
     def _render_file_row(
@@ -685,6 +779,7 @@ class AppUIBuilder:
         toggle=None,
         toggle_expanded=False,
         toggle_count=0,
+        meta_summary=None,
     ):
         row = ctk.CTkFrame(container, fg_color="transparent")
         row.pack(fill="x", padx=(10 + indent, 10), pady=4)
@@ -719,24 +814,27 @@ class AppUIBuilder:
                 text_color=TEXT,
             ).pack(side="right", padx=(8, 0))
 
-        weight_value = str(current_weights.get(weight_target, current_weights.get(source, 1)))
-        weight_selector = ctk.CTkSegmentedButton(
-            row,
-            values=["1", "2", "3"],
-            width=96,
-            height=28,
-            command=lambda value, item=weight_target: self.app.update_file_weight(item, value),
-            fg_color=SOFT,
-            selected_color=ACCENT,
-            selected_hover_color=ACCENT_SOFT,
-            unselected_color=SOFT,
-            unselected_hover_color="#dcdcdc",
-            text_color=TEXT,
-        )
-        weight_selector.set(weight_value)
-        weight_selector.pack(side="right")
-
-        ctk.CTkLabel(row, text="权重", text_color=MUTED).pack(side="right", padx=(0, 6))
+        is_failed_only = str((meta_summary or {}).get("status") or "").lower() == "failed" and not doc_ids
+        if not is_failed_only:
+            weight_value = str(current_weights.get(weight_target, current_weights.get(source, 1)))
+            weight_selector = ctk.CTkSegmentedButton(
+                row,
+                values=["1", "2", "3"],
+                width=96,
+                height=28,
+                command=lambda value, item=weight_target: self.app.update_file_weight(item, value),
+                fg_color=SOFT,
+                selected_color=ACCENT,
+                selected_hover_color=ACCENT_SOFT,
+                unselected_color=SOFT,
+                unselected_hover_color="#dcdcdc",
+                text_color=TEXT,
+            )
+            weight_selector.set(weight_value)
+            weight_selector.pack(side="right")
+            ctk.CTkLabel(row, text="权重", text_color=MUTED).pack(side="right", padx=(0, 6))
+        else:
+            ctk.CTkLabel(row, text="未入库", text_color=ERROR).pack(side="right", padx=(0, 6))
 
         self.app.file_checkboxes[key] = {"var": var, "widget": checkbox}
         self.app.file_id_map[key] = list(doc_ids)

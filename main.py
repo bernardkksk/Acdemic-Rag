@@ -5,11 +5,17 @@ import pickle
 import shutil
 import threading
 import time
+import warnings
 from tkinter import filedialog, messagebox
+
+os.environ.setdefault("USER_AGENT", "AcademicRAG/1.0")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+warnings.filterwarnings("ignore", message=".*RequestsDependencyWarning.*")
 
 import customtkinter as ctk
 from langchain_chroma import Chroma
 
+import academic_prompt
 import ingest
 import query
 from model import ModelManager
@@ -51,16 +57,31 @@ class AcademicRAGApp(ctk.CTk):
         self.file_weight_targets = {}
         self.file_tree_state = {"groups": {}, "urls": {}}
         self.file_tree_payload = None
+        self.is_library_maintenance = False
         self.is_busy = False
         self.latest_answer_text = ""
+        self.last_progress_message = ""
+        self.target_document_path = ""
+        self.target_document_text = ""
+        self.target_document_name = ""
         self.placeholder_text = "模型预加载完成后，请先选择主库与次库并点击“确认并加载知识库”。"
         self.current_stage = "model"
+        self.stage_progress_map = {
+            "model": 0.12,
+            "library": 0.28,
+            "expand": 0.42,
+            "retrieve": 0.62,
+            "rerank": 0.82,
+            "generate": 0.94,
+        }
+        self.last_progress_value = 0.0
 
         self.ui = AppUIBuilder(self)
         self.ui.setup_sidebar()
         self.ui.create_tabs()
         self.ui.refresh_sidebar()
         self.ui.refresh_chat_selectors()
+        self.on_answer_style_change(self.answer_style_var.get())
         self._set_answer_text(self.placeholder_text)
 
         self.set_pipeline_state("model", "模型预加载中", "正在检查本地缓存…", completed=False)
@@ -159,13 +180,22 @@ class AcademicRAGApp(ctk.CTk):
         display_text = summary if not detail else f"{summary} · {detail}"
         self.status_text.configure(text=display_text, text_color=TEXT if not completed else SUCCESS)
         self.progress_bar.configure(progress_color=SUCCESS if completed else IN_PROGRESS)
-        self.progress_bar.set(1.0 if completed else 0.35)
+        progress_value = self._resolve_progress_value(active_step, completed=completed)
+        self.last_progress_value = progress_value
+        self.progress_bar.set(progress_value)
 
     def set_pipeline_error(self, summary, detail=""):
         display_text = summary if not detail else f"{summary} · {detail}"
         self.status_text.configure(text=display_text, text_color=ERROR)
         self.progress_bar.configure(progress_color=ERROR)
-        self.progress_bar.set(1.0)
+        progress_value = self._resolve_progress_value(self.current_stage, completed=False)
+        self.last_progress_value = progress_value
+        self.progress_bar.set(progress_value)
+
+    def _resolve_progress_value(self, active_step, completed=False):
+        if completed:
+            return 1.0
+        return float(self.stage_progress_map.get(active_step, 0.18))
 
     def preview_library(self, library):
         self.current_library = library
@@ -265,14 +295,15 @@ class AcademicRAGApp(ctk.CTk):
 
         def run():
             try:
-                query.preload_libraries(self.active_retrieval_libraries)
+                loaded_indexes = query.preload_libraries(self.active_retrieval_libraries)
+                total_chunks = sum(len(index.chunks) for index in loaded_indexes)
                 self.after(0, self.refresh_file_list)
                 self.after(
                     0,
                     lambda: self.set_pipeline_state(
                         "library",
                         "知识库加载完毕",
-                        f"当前检索库：{library_names}",
+                        f"当前检索库：{library_names} · 已载入 {total_chunks} 个条目",
                         completed=True,
                     ),
                 )
@@ -318,6 +349,7 @@ class AcademicRAGApp(ctk.CTk):
             self.file_tree_payload["ids"],
             self.file_tree_payload["count"],
             self.file_tree_payload["weights"],
+            self.file_tree_payload.get("status_manifest", {}),
         )
 
     def refresh_file_list(self):
@@ -332,34 +364,44 @@ class AcademicRAGApp(ctk.CTk):
             try:
                 db_path = self.current_library["path"]
                 pkl_path = os.path.join(db_path, "chunks.pkl")
-                if not os.path.exists(pkl_path):
+                status_manifest = ingest.load_ingest_status(db_path)
+                if not os.path.exists(pkl_path) and not status_manifest:
                     self.after(0, lambda: self.ui.render_empty_files("当前知识库还没有导入内容。"))
                     return
 
-                vectordb = Chroma(
-                    persist_directory=db_path,
-                    embedding_function=ModelManager.get_embeddings(),
-                    collection_name="rag_collection",
-                )
-                try:
-                    total = vectordb._collection.count()
-                except Exception:
-                    total = 0
+                total = 0
+                metas = []
+                ids = []
+                if os.path.exists(pkl_path):
+                    vectordb = Chroma(
+                        persist_directory=db_path,
+                        embedding_function=ModelManager.get_embeddings(),
+                        collection_name="rag_collection",
+                    )
+                    try:
+                        total = vectordb._collection.count()
+                    except Exception:
+                        total = 0
 
-                if total <= 0:
+                if total <= 0 and not status_manifest:
                     self.after(0, lambda: self.ui.render_empty_files("当前知识库里还没有可编辑的内容。"))
                     return
 
-                batch_size = 1000
-                metas = []
-                ids = []
-                for offset in range(0, total, batch_size):
-                    batch = vectordb.get(include=["metadatas"], limit=batch_size, offset=offset)
-                    metas.extend(batch["metadatas"])
-                    ids.extend(batch["ids"])
+                if total > 0:
+                    batch_size = 1000
+                    for offset in range(0, total, batch_size):
+                        batch = vectordb.get(include=["metadatas"], limit=batch_size, offset=offset)
+                        metas.extend(batch["metadatas"])
+                        ids.extend(batch["ids"])
 
                 weights = self.load_all_weights()
-                self.file_tree_payload = {"metas": metas, "ids": ids, "count": total, "weights": dict(weights)}
+                self.file_tree_payload = {
+                    "metas": metas,
+                    "ids": ids,
+                    "count": total,
+                    "weights": dict(weights),
+                    "status_manifest": dict(status_manifest),
+                }
                 self.after(0, self.rerender_file_tree)
             except Exception as exc:
                 error_text = str(exc)
@@ -432,6 +474,8 @@ class AcademicRAGApp(ctk.CTk):
                 with open(self.get_weight_file(), "w", encoding="utf-8") as handle:
                     json.dump(weights, handle, ensure_ascii=False, indent=2)
 
+            ingest.remove_ingest_status_entries(self.current_library["path"], list(delete_sources) + list(delete_parents))
+
             query.invalidate_library_cache(self.current_library["path"])
             self.refresh_file_list()
         except Exception as exc:
@@ -455,10 +499,13 @@ class AcademicRAGApp(ctk.CTk):
             except Exception:
                 pass
 
-            for file_name in ["chunks.pkl", "file_weights.json"]:
+            for file_name in ["chunks.pkl", "file_weights.json", "library_meta.json", ingest.PDF_STATUS_FILE]:
                 file_path = os.path.join(self.current_library["path"], file_name)
                 if os.path.exists(file_path):
                     os.remove(file_path)
+            ocr_cache_dir = os.path.join(self.current_library["path"], ingest.OCR_CACHE_DIR)
+            if os.path.isdir(ocr_cache_dir):
+                shutil.rmtree(ocr_cache_dir, ignore_errors=True)
 
             query.invalidate_library_cache(self.current_library["path"])
             self.refresh_file_list()
@@ -473,6 +520,11 @@ class AcademicRAGApp(ctk.CTk):
         folder = filedialog.askdirectory()
         if not folder:
             return
+        messagebox.showinfo(
+            "PDF 导入提示",
+            "系统现在只支持导入已经具备文本层的 PDF，不再执行 OCR。\n"
+            "如果某些 PDF 是扫描件或无法直接读取文本，请先在外部完成 OCR，再重新导入。",
+        )
         mode = "new" if messagebox.askyesno("导入模式", "是否清空当前主库后重建？") else "append"
         threading.Thread(target=self.run_ingest_thread, args=(folder, None, mode, False), daemon=True).start()
 
@@ -488,14 +540,71 @@ class AcademicRAGApp(ctk.CTk):
         mode = "new" if messagebox.askyesno("导入模式", "是否清空当前主库后重建？") else "append"
         threading.Thread(target=self.run_ingest_thread, args=(None, [url], mode, recursive), daemon=True).start()
 
+    def rebuild_current_library_index(self):
+        if not self.current_library:
+            messagebox.showwarning("提示", "请先选择一个知识库。")
+            return
+
+        if self.is_library_maintenance:
+            messagebox.showwarning("提示", "当前已有知识库维护任务在运行，请稍后再试。")
+            return
+
+        confirmed = messagebox.askyesno(
+            "重建索引",
+            f"确定为当前知识库 [{self.current_library['name']}] 重建 chunk_id 和向量索引吗？\n这不会删除原始材料，但会重写当前库的 Chroma 索引与 chunks.pkl 元数据。",
+        )
+        if not confirmed:
+            return
+
+        self._set_library_maintenance(True)
+        self.last_progress_message = ""
+        self._append_progress(f"开始重建知识库 [{self.current_library['name']}] 的索引...")
+        self.set_pipeline_state("library", "知识库重建中", f"正在重建 [{self.current_library['name']}]...", completed=False)
+
+        def callback(message):
+            self.after(0, lambda message=message: self._append_progress(message))
+
+        def run():
+            try:
+                callback(f"正在准备 embedding 模型… 首次加载 {ModelManager.EMBEDDING_MODEL_NAME} 可能需要几分钟。")
+                ModelManager.ensure_model_ready(status_callback=callback)
+                ingest.rebuild_library_index(
+                    db_path=self.current_library["path"],
+                    progress_callback=callback,
+                )
+                query.invalidate_library_cache(self.current_library["path"])
+                self.after(0, self.refresh_file_list)
+                self.after(
+                    0,
+                    lambda: self.set_pipeline_state(
+                        "library",
+                        "知识库重建完成",
+                        f"当前知识库 [{self.current_library['name']}] 已完成 chunk_id 与索引重建。",
+                        completed=True,
+                    ),
+                )
+            except Exception as exc:
+                error_text = str(exc)
+                self.after(0, lambda error_text=error_text: self._append_progress(f"重建失败：{error_text}"))
+                self.after(0, lambda error_text=error_text: messagebox.showerror("错误", f"重建失败：{error_text}"))
+
+            finally:
+                self.after(0, lambda: self._set_library_maintenance(False))
+
+        threading.Thread(target=run, daemon=True).start()
+
     def run_ingest_thread(self, docs_dir, urls, mode, recursive_web):
+        self._set_library_maintenance(True)
+        self.last_progress_message = ""
         self._append_progress("开始导入…")
 
         def callback(message):
             self.after(0, lambda: self._append_progress(message))
 
         try:
-            ingest.run_ingest(
+            callback(f"正在准备 embedding 模型… 首次加载 {ModelManager.EMBEDDING_MODEL_NAME} 可能需要几分钟。")
+            ModelManager.ensure_model_ready(status_callback=callback)
+            result = ingest.run_ingest(
                 docs_dir=docs_dir,
                 urls=urls,
                 mode=mode,
@@ -505,18 +614,118 @@ class AcademicRAGApp(ctk.CTk):
             )
             query.invalidate_library_cache(self.current_library["path"])
             self.after(0, self.refresh_file_list)
+            failed_pdfs = list((result or {}).get("failed_pdfs") or [])
+            if failed_pdfs:
+                failed_lines = []
+                for item in failed_pdfs[:12]:
+                    name = str(item.get("name") or "未知文件")
+                    reason = str(item.get("reason") or "未读取到可用文本")
+                    failed_lines.append(f"{name}\n原因：{reason}")
+                suffix = "\n\n其余文件请在文件管理页查看。" if len(failed_pdfs) > 12 else ""
+                message = (
+                    "以下 PDF 没能正确读取文本，请先完成 OCR 后再重新导入：\n\n"
+                    + "\n\n".join(failed_lines)
+                    + suffix
+                )
+                self.after(0, lambda message=message: messagebox.showwarning("PDF 读取失败", message))
         except Exception as exc:
             error_text = str(exc)
             self.after(0, lambda error_text=error_text: self._append_progress(f"导入失败：{error_text}"))
+            self.after(0, lambda error_text=error_text: messagebox.showerror("错误", f"导入失败：{error_text}"))
+        finally:
+            self.after(0, lambda: self._set_library_maintenance(False))
 
     def _append_progress(self, message):
+        compact_message = str(message or "").strip()
+        if not compact_message or compact_message == self.last_progress_message:
+            return
+        self.last_progress_message = compact_message
         self.progress_box.configure(state="normal")
-        self.progress_box.insert("end", message + "\n")
+        existing_lines = self.progress_box.get("1.0", "end-1c").splitlines()
+        existing_lines.append(compact_message)
+        existing_lines = existing_lines[-120:]
+        self.progress_box.delete("1.0", "end")
+        self.progress_box.insert("end", "\n".join(existing_lines) + "\n")
         self.progress_box.see("end")
         self.progress_box.configure(state="disabled")
 
+    def _set_library_maintenance(self, active: bool):
+        self.is_library_maintenance = active
+
+    def on_answer_style_change(self, choice=None):
+        style = choice or self.answer_style_var.get()
+        if not hasattr(self, "target_document_panel"):
+            return
+        if academic_prompt.requires_target_document(style):
+            if not self.target_document_panel.winfo_manager():
+                self.target_document_panel.pack(
+                    fill="x",
+                    padx=14,
+                    pady=(0, 6),
+                    after=self.answer_style_menu.master,
+                )
+        else:
+            self.target_document_panel.pack_forget()
+
+    def select_target_document(self):
+        file_path = filedialog.askopenfilename(
+            title="选择目标 Word 文章",
+            filetypes=[
+                ("Word Documents", "*.docx"),
+                ("All Files", "*.*"),
+            ],
+        )
+        if not file_path:
+            return
+        try:
+            text = self._load_target_document_text(file_path)
+        except Exception as exc:
+            messagebox.showerror("目标文章读取失败", str(exc))
+            return
+
+        self.target_document_path = file_path
+        self.target_document_name = os.path.basename(file_path)
+        self.target_document_text = text
+        self._update_target_document_label()
+
+    def clear_target_document(self):
+        self.target_document_path = ""
+        self.target_document_name = ""
+        self.target_document_text = ""
+        self._update_target_document_label()
+
+    def _update_target_document_label(self):
+        if not hasattr(self, "target_document_label"):
+            return
+        if not self.target_document_name:
+            self.target_document_label.configure(text="未选择")
+            return
+        char_count = len(self.target_document_text or "")
+        label = self.target_document_name
+        if len(label) > 24:
+            label = label[:21] + "..."
+        self.target_document_label.configure(text=f"{label}\n{char_count} 字符")
+
+    def _load_target_document_text(self, file_path):
+        suffix = os.path.splitext(file_path)[1].lower()
+        if suffix != ".docx":
+            raise RuntimeError("当前目标文章模块只支持 .docx 文件。请先将 Word 文档另存为 .docx 后再选择。")
+        try:
+            import docx2txt
+
+            text = docx2txt.process(file_path)
+        except Exception as exc:
+            raise RuntimeError(f"Word 文档无法读取：{exc}") from exc
+        normalized = str(text or "").strip()
+        if not normalized:
+            raise RuntimeError("Word 文档中没有读取到可用正文。")
+        return normalized
+
     def ask_question(self):
         if self.is_busy:
+            return "break"
+        if self.is_library_maintenance:
+            messagebox.showwarning("提示", "知识库正在导入或重建中，请稍后再提问。")
             return "break"
         if not self.current_config:
             messagebox.showwarning("提示", "请先在配置页保存配置，并在问答页选中它。")
@@ -525,7 +734,15 @@ class AcademicRAGApp(ctk.CTk):
             messagebox.showwarning("提示", "请先确认主库和次库。")
             return "break"
 
+        answer_style = self.answer_style_var.get()
+        requires_target = academic_prompt.requires_target_document(answer_style)
+        if requires_target and not self.target_document_text:
+            messagebox.showwarning("提示", "当前模式需要先选择目标 Word 文章。")
+            return "break"
+
         question = self.question_box.get("1.0", "end").strip()
+        if not question and requires_target:
+            question = f"请根据目标文章执行“{answer_style}”任务。"
         if not question:
             return "break"
 
@@ -563,11 +780,18 @@ class AcademicRAGApp(ctk.CTk):
                     model=model_name,
                     primary_library=primary,
                     secondary_libraries=secondaries,
-                    answer_style=self.answer_style_var.get(),
+                    answer_style=answer_style,
+                    target_document={
+                        "path": self.target_document_path,
+                        "name": self.target_document_name,
+                        "text": self.target_document_text,
+                    } if requires_target else None,
                     progress_callback=progress,
                 )
 
-                source_line = "\n\n参考来源：\n" + "\n".join(f"- {item}" for item in sources[:20]) if sources else ""
+                source_line = ""
+                if sources and not requires_target:
+                    source_line = "\n\n参考来源：\n" + "\n".join(f"- {item}" for item in sources[:20])
                 final_text = self._build_dialog_text(question, answer + source_line, model_name)
                 token_count = tokens.get("total_tokens", 0)
                 self.after(0, lambda: self._set_answer_text(final_text))
@@ -620,7 +844,7 @@ class AcademicRAGApp(ctk.CTk):
 
         file_path = filedialog.asksaveasfilename(
             title="保存回答",
-            initialfile="rag_anwser.txt",
+            initialfile="rag.txt",
             defaultextension=".txt",
             filetypes=[
                 ("Text Files", "*.txt"),
@@ -635,6 +859,9 @@ class AcademicRAGApp(ctk.CTk):
             with open(file_path, "w", encoding="utf-8") as handle:
                 handle.write(content)
             messagebox.showinfo("成功", f"回答已保存到：{file_path}")
+            self._set_answer_text(self.placeholder_text)
+            self.highlight_sources([])
+            self.question_box.focus_set()
         except Exception as exc:
             messagebox.showerror("错误", f"保存失败：{exc}")
 
